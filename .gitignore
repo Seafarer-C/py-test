@@ -1,0 +1,9 @@
+.venv-win/
+.venv/
+__pycache__/
+*.py[cod]
+.playwright-browsers/
+build/
+dist/
+*.spec.bak
+.DS_Store

@@ -1,0 +1,5 @@
+openpyxl>=3.1,<4
+Pillow>=10,<13
+gdown>=5,<6
+py7zr>=0.22,<2
+playwright>=1.50,<2

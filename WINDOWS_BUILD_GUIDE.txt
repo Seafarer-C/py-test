@@ -1,0 +1,75 @@
+Excel 订单素材下载工具——Windows 打包操作说明
+Power by 灵图（ipoddy.cn）
+
+〇、推荐：GitHub Actions 云端打包（无需本机 Windows）
+
+1. 将本仓库推送到 GitHub。
+
+2. 打开仓库 Actions 页，选择 “Build Windows EXE”，点击 Run workflow。
+
+3. 构建成功后，在该次运行页面下载 Artifact：
+   Excel订单素材下载工具-windows
+
+4. 也可以打 tag 触发构建并自动发 Release，例如：
+   git tag v1.0.0
+   git push origin v1.0.0
+
+以下为本机手动打包方式。
+
+
+一、Windows 电脑需要准备
+
+1. 安装 64 位 Python 3.12：
+   https://www.python.org/downloads/
+
+2. 安装时务必勾选：
+   Add python.exe to PATH
+
+3. Windows 电脑需要能正常访问互联网，用于首次下载打包依赖和 Chromium。
+
+
+二、开始打包
+
+1. 将本压缩包完整解压到一个路径较短的目录，例如：
+   D:\xlsx2files-build
+
+2. 不要直接在压缩包预览窗口内运行文件。
+
+3. 双击：
+   build_windows.bat
+
+4. 首次打包需要下载依赖，请耐心等待。看到“Build completed”表示成功。
+
+5. 最终交付文件位于：
+   dist\Excel订单素材下载工具.exe
+
+   同目录还会生成：
+   dist\客户使用说明.txt
+   dist\SHA256.txt
+
+
+三、交付给客户
+
+将以下三个文件一起压缩为 ZIP 后发给客户：
+
+1. Excel订单素材下载工具.exe
+2. 客户使用说明.txt
+3. SHA256.txt
+
+客户不需要安装 Python，也不需要另外安装 Playwright。
+
+
+四、常见问题
+
+1. 提示找不到 Python
+   请确认安装的是 Python 3.12 64 位，并在安装时勾选 Add python.exe to PATH。
+
+2. 下载依赖失败
+   检查 Windows 电脑网络，然后重新双击 build_windows.bat。已经下载的内容通常会被复用。
+
+3. Windows Defender 或其他杀毒软件拦截
+   PyInstaller 打包的未签名程序可能触发误报。确认源码和构建机器可信后，将构建目录加入允许列表再重新打包。
+
+4. 客户首次打开出现“Windows 已保护你的电脑”
+   点击“更多信息”，再点击“仍要运行”。正式长期分发时建议购买代码签名证书。
+
