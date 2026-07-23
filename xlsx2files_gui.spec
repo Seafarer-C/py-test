@@ -21,6 +21,7 @@ hiddenimports = playwright_hiddenimports + [
     "playwright.sync_api",
     "gdown",
     "py7zr",
+    "certifi",
     "PIL._tkinter_finder",
 ]
 

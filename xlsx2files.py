@@ -9,11 +9,14 @@ import mimetypes
 import os
 import re
 import shutil
+import ssl
 import sys
 import tarfile
 import tempfile
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
 
@@ -22,7 +25,43 @@ import openpyxl
 
 INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 URL_RE = re.compile(r"https?://[^\s;，；]+", re.IGNORECASE)
-ARCHIVE_SUFFIXES = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".7z")
+ARCHIVE_SUFFIXES = (".tar.gz", ".tar.bz2", ".tgz", ".tbz2", ".zip", ".tar", ".7z")
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
+HTTP_TIMEOUT = 90
+BROWSER_TIMEOUT = 45
+
+
+def ssl_context() -> ssl.SSLContext:
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+SSL_CONTEXT = ssl_context()
+
+
+@dataclass
+class ProgressEvent:
+    order_index: int
+    order_total: int
+    order_no: str
+    item_index: int = 0
+    item_total: int = 0
+    message: str = ""
+
+
+ProgressCallback = Callable[[ProgressEvent], None]
+
+
+def emit(callback: ProgressCallback | None, event: ProgressEvent) -> None:
+    if callback:
+        callback(event)
 
 
 def safe_name(value: object, fallback: str) -> str:
@@ -78,10 +117,19 @@ def finalize_order_folder(folder: Path, folder_name: str, failed_urls: list[str]
     return folder
 
 
+def split_filename(name: str) -> tuple[str, str]:
+    lower = name.lower()
+    for suffix in ARCHIVE_SUFFIXES:
+        if lower.endswith(suffix):
+            return name[: -len(suffix)], name[-len(suffix) :]
+    path = Path(name)
+    return path.stem, path.suffix
+
+
 def unique_path(path: Path) -> Path:
     if not path.exists():
         return path
-    stem, suffix = path.stem, path.suffix
+    stem, suffix = split_filename(path.name)
     index = 2
     while True:
         candidate = path.with_name(f"{stem}_{index}{suffix}")
@@ -104,7 +152,11 @@ def extract_urls(value: object) -> list[str]:
                 item = unquote(item.strip())
                 if item:
                     # Printerval 的相对素材路径实际位于 assets 子域名。
-                    asset_host = "assets.printerval.com" if parsed.netloc.endswith("printerval.com") else parsed.netloc
+                    asset_host = (
+                        "assets.printerval.com"
+                        if parsed.netloc.endswith("printerval.com")
+                        else parsed.netloc
+                    )
                     found.append(item if item.startswith("http") else f"{parsed.scheme}://{asset_host}{item}")
         else:
             found.append(url.rstrip(","))
@@ -116,9 +168,9 @@ def discover_page_images(page_url: str) -> list[str]:
     parsed = urlparse(page_url)
     if not (parsed.netloc.endswith("printerval.com") and "/folder-design" in parsed.path):
         return []
-    request = Request(page_url, headers={"User-Agent": "Mozilla/5.0 xlsx2files/1.0"})
+    request = Request(page_url, headers={"User-Agent": USER_AGENT})
     try:
-        with urlopen(request, timeout=60) as response:
+        with urlopen(request, timeout=60, context=SSL_CONTEXT) as response:
             page = html.unescape(response.read().decode("utf-8", errors="ignore")).replace("\\/", "/")
     except Exception as exc:
         print(f"    警告：无法解析页面效果图：{exc}", file=sys.stderr)
@@ -152,8 +204,8 @@ def filename_from_response(url: str, headers: object, index: int) -> str:
 
 
 def download_http(url: str, target_dir: Path, index: int) -> list[Path]:
-    request = Request(url, headers={"User-Agent": "Mozilla/5.0 xlsx2files/1.0"})
-    with urlopen(request, timeout=90) as response:
+    request = Request(url, headers={"User-Agent": USER_AGENT})
+    with urlopen(request, timeout=HTTP_TIMEOUT, context=SSL_CONTEXT) as response:
         final_url = response.geturl()
         filename = filename_from_response(final_url, response.headers, index)
         target = unique_path(target_dir / filename)
@@ -217,7 +269,7 @@ def download_with_browser(
     target_dir: Path,
     profile_dir: Path,
     headless: bool,
-    timeout_seconds: int = 45,
+    timeout_seconds: int = BROWSER_TIMEOUT,
 ) -> list[Path]:
     """使用本机 Chrome/Edge 会话触发下载，作为直连失败后的回退。"""
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
@@ -269,7 +321,7 @@ def download_with_browser(
                 '[aria-label^="下载"]',
                 '[aria-label="Download"]',
                 '[aria-label^="Download"]',
-                'a[download]',
+                "a[download]",
             ]
             for selector in selectors:
                 buttons = page.locator(selector)
@@ -302,11 +354,33 @@ def download_with_browser(
     return [p for p in target_dir.rglob("*") if p.is_file() and p.resolve() not in before]
 
 
+def is_archive_file(path: Path) -> bool:
+    lower = path.name.lower()
+    if lower.endswith(ARCHIVE_SUFFIXES):
+        return True
+    try:
+        if zipfile.is_zipfile(path):
+            return True
+        if tarfile.is_tarfile(path):
+            return True
+    except Exception:
+        return False
+    return False
+
+
 def safe_extract_archive(archive: Path) -> Path | None:
-    lower = archive.name.lower()
-    if not lower.endswith(ARCHIVE_SUFFIXES):
+    if not is_archive_file(archive):
         return None
-    destination = unique_path(archive.parent / re.sub(r"\.(tar\.gz|tar\.bz2|zip|tgz|tbz2|tar|7z)$", "", archive.name, flags=re.I))
+    lower = archive.name.lower()
+    stem = archive.name
+    for suffix in ARCHIVE_SUFFIXES:
+        if lower.endswith(suffix):
+            stem = archive.name[: -len(suffix)]
+            break
+    else:
+        stem = archive.stem
+
+    destination = unique_path(archive.parent / safe_name(stem, "archive"))
     destination.mkdir(parents=True)
     root = destination.resolve()
 
@@ -316,25 +390,30 @@ def safe_extract_archive(archive: Path) -> Path | None:
             if root != resolved and root not in resolved.parents:
                 raise RuntimeError(f"压缩包包含不安全路径：{name}")
 
-    if zipfile.is_zipfile(archive):
-        with zipfile.ZipFile(archive) as package:
-            validate(package.namelist())
-            package.extractall(destination)
-    elif tarfile.is_tarfile(archive):
-        with tarfile.open(archive) as package:
-            validate(package.getnames())
-            package.extractall(destination, filter="data")
-    elif lower.endswith(".7z"):
-        try:
-            import py7zr
-        except ImportError as exc:
-            raise RuntimeError("解压 7z 需要安装 py7zr（pip install -r requirements.txt）") from exc
-        with py7zr.SevenZipFile(archive) as package:
-            validate(package.getnames())
-            package.extractall(destination)
-    else:
-        shutil.rmtree(destination)
-        return None
+    try:
+        if zipfile.is_zipfile(archive) or lower.endswith(".zip"):
+            with zipfile.ZipFile(archive) as package:
+                validate(package.namelist())
+                package.extractall(destination)
+        elif tarfile.is_tarfile(archive) or lower.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2")):
+            with tarfile.open(archive) as package:
+                validate(package.getnames())
+                package.extractall(destination, filter="data")
+        elif lower.endswith(".7z"):
+            try:
+                import py7zr
+            except ImportError as exc:
+                raise RuntimeError("解压 7z 需要安装 py7zr（pip install -r requirements.txt）") from exc
+            with py7zr.SevenZipFile(archive) as package:
+                validate(package.getnames())
+                package.extractall(destination)
+        else:
+            shutil.rmtree(destination)
+            return None
+    except Exception:
+        if destination.exists():
+            shutil.rmtree(destination, ignore_errors=True)
+        raise
     return destination
 
 
@@ -365,21 +444,37 @@ def write_text_summary(sheet: object, row: int, headers: list[str], excluded: se
     return path
 
 
-def process(args: argparse.Namespace) -> int:
+def collect_cell_urls(cell_value: object) -> list[str]:
+    """提取单元格全部下载链接，并补充 Printerval 页面效果图。"""
+    urls = extract_urls(cell_value)
+    if not cell_value:
+        return urls
+    page_url_match = URL_RE.search(str(cell_value))
+    if not page_url_match:
+        return urls
+    extras = discover_page_images(page_url_match.group(0))
+    if extras:
+        print(f"  发现无下载按钮的页面效果图：{len(extras)} 张")
+        urls = list(dict.fromkeys(extras + urls))
+    return urls
+
+
+def process(args: argparse.Namespace, progress_callback: ProgressCallback | None = None) -> int:
     workbook = openpyxl.load_workbook(args.xlsx, data_only=True)
     sheet = workbook[args.sheet] if args.sheet else workbook.active
     headers = [str(cell.value or f"未命名列{cell.column}").strip() for cell in sheet[1]]
     qr_columns = [i for i, name in enumerate(headers, 1) if name == "二维码"]
     download_columns = [i for i, name in enumerate(headers, 1) if "下载地址" in name]
     if not qr_columns:
-        raise RuntimeError("找不到名为“二维码”的列")
-    if not download_columns:
+        print("警告：找不到名为“二维码”的列，将跳过二维码提取", file=sys.stderr)
+    if not download_columns and not args.skip_downloads:
         raise RuntimeError("找不到名称含“下载地址”的列")
 
     output_root = Path(args.output)
     output_root.mkdir(parents=True, exist_ok=True)
-    qr_images = image_map(sheet, qr_columns[0])
+    qr_images = image_map(sheet, qr_columns[0]) if qr_columns else {}
     last_row = min(sheet.max_row, 1 + args.limit) if args.limit else sheet.max_row
+    order_total = max(0, last_row - 1)
     failures = 0
     cancel_event = getattr(args, "cancel_event", None)
 
@@ -387,74 +482,126 @@ def process(args: argparse.Namespace) -> int:
         if cancel_event and cancel_event.is_set():
             print("已请求停止，任务结束")
             return 130
+        order_index = row - 1
         folder_name = safe_name(sheet.cell(row, 1).value, f"第{row}行")
         folder = prepare_order_folder(output_root, folder_name)
-        print(f"[{row - 1}/{last_row - 1}] {folder_name}")
+        print(f"[{order_index}/{order_total}] {folder_name}")
+        emit(
+            progress_callback,
+            ProgressEvent(
+                order_index=order_index,
+                order_total=order_total,
+                order_no=folder_name,
+                message=f"开始处理 {folder_name}",
+            ),
+        )
         legacy_names = {download_category(headers[column - 1], column) for column in download_columns}
         migrated = flatten_legacy_download_dirs(folder, legacy_names)
         if migrated:
             print(f"  已将旧分类目录中的 {migrated} 项内容平铺到订单目录")
         write_text_summary(sheet, row, headers, set(qr_columns + download_columns), folder)
-        if row in qr_images:
-            write_qr(qr_images[row], folder)
-        else:
-            print(f"  警告：第 {row} 行没有找到二维码图片", file=sys.stderr)
-            failures += 1
+        if qr_columns:
+            if row in qr_images:
+                write_qr(qr_images[row], folder)
+            else:
+                print(f"  警告：第 {row} 行没有找到二维码图片", file=sys.stderr)
+                failures += 1
 
         download_index = 1
         failed_urls: list[str] = []
+        pending_urls: list[tuple[str, str]] = []
         for column in ([] if args.skip_downloads else download_columns):
-            cell_value = sheet.cell(row, column).value
-            urls = extract_urls(cell_value)
-            if cell_value:
-                page_url_match = URL_RE.search(str(cell_value))
-                if page_url_match:
-                    extras = discover_page_images(page_url_match.group(0))
-                    if extras:
-                        print(f"  发现无下载按钮的页面效果图：{len(extras)} 张")
-                        urls = list(dict.fromkeys(extras + urls))
-            if not urls:
-                continue
-            print(f"  下载类别：{headers[column - 1]}（{len(urls)} 个链接）")
+            category = headers[column - 1]
+            urls = collect_cell_urls(sheet.cell(row, column).value)
             for url in urls:
-                if cancel_event and cancel_event.is_set():
-                    print("已请求停止，将在当前订单结束前停止")
-                    return 130
+                pending_urls.append((category, url))
+
+        item_total = len(pending_urls)
+        for item_index, (category, url) in enumerate(pending_urls, start=1):
+            if cancel_event and cancel_event.is_set():
+                print("已请求停止，将在当前订单结束前停止")
+                finalize_order_folder(folder, folder_name, failed_urls)
+                return 130
+            emit(
+                progress_callback,
+                ProgressEvent(
+                    order_index=order_index,
+                    order_total=order_total,
+                    order_no=folder_name,
+                    item_index=item_index,
+                    item_total=item_total,
+                    message=f"正在下载 {item_index}/{item_total}",
+                ),
+            )
+            print(f"  下载类别：{category}")
+            browser_used = False
+            try:
                 try:
+                    files = download_url(url, folder, download_index)
+                except Exception as direct_error:
+                    if args.browser_fallback == "off":
+                        raise
+                    is_google_drive = urlparse(url).netloc.lower().endswith("drive.google.com")
+                    if is_google_drive and args.browser_fallback == "headless":
+                        raise RuntimeError(
+                            f"Google Drive 自动下载失败：{direct_error}。"
+                            "为避免无头浏览器等待登录而阻塞，已跳过浏览器回退；"
+                            "原始链接将写入 link.txt"
+                        ) from direct_error
+                    mode = "无头" if args.browser_fallback == "headless" else "可见"
+                    browser_used = True
+                    print(f"    直接下载失败，启动{mode}浏览器回退：{direct_error}")
+                    print(f"    浏览器回退最长等待 {BROWSER_TIMEOUT} 秒：{url}")
+                    files = download_with_browser(
+                        url,
+                        folder,
+                        Path(args.browser_profile),
+                        headless=args.browser_fallback == "headless",
+                    )
+                    print("    浏览器回退成功")
+                for downloaded in files:
                     try:
-                        files = download_url(url, folder, download_index)
-                    except Exception as direct_error:
-                        if args.browser_fallback == "off":
-                            raise
-                        is_google_drive = urlparse(url).netloc.lower().endswith("drive.google.com")
-                        if is_google_drive and args.browser_fallback == "headless":
-                            raise RuntimeError(
-                                f"Google Drive 自动下载失败：{direct_error}。"
-                                "为避免无头浏览器等待登录而阻塞，已跳过浏览器回退；"
-                                "原始链接将写入 link.txt"
-                            ) from direct_error
-                        mode = "无头" if args.browser_fallback == "headless" else "可见"
-                        print(f"    直接下载失败，启动{mode}浏览器回退：{direct_error}")
-                        print(f"    浏览器回退最长等待 45 秒：{url}")
-                        files = download_with_browser(
-                            url,
-                            folder,
-                            Path(args.browser_profile),
-                            headless=args.browser_fallback == "headless",
-                        )
-                        print("    浏览器回退成功")
-                    for downloaded in files:
                         extracted = safe_extract_archive(downloaded)
-                        print(f"  已下载：{downloaded.name}" + (f"，已解压到 {extracted.name}" if extracted else ""))
-                except Exception as exc:
-                    failures += 1
-                    failed_urls.append(url)
-                    print(f"  下载失败：{url}\n    {exc}", file=sys.stderr)
-                download_index += 1
+                        print(
+                            f"  已下载：{downloaded.name}"
+                            + (f"，已解压到 {extracted.name}" if extracted else "")
+                        )
+                    except Exception as extract_error:
+                        failures += 1
+                        print(
+                            f"  解压失败：订单={folder_name} 类别={category} 文件={downloaded.name}\n"
+                            f"    原因：{extract_error}",
+                            file=sys.stderr,
+                        )
+            except Exception as exc:
+                failures += 1
+                failed_urls.append(url)
+                print(
+                    f"  下载失败：订单={folder_name} 类别={category}\n"
+                    f"    URL={url}\n"
+                    f"    原因：{exc}\n"
+                    f"    已启动浏览器回退：{'是' if browser_used else '否'}\n"
+                    f"    将写入 link.txt：是",
+                    file=sys.stderr,
+                )
+            download_index += 1
+
         if not args.skip_downloads:
             folder = finalize_order_folder(folder, folder_name, failed_urls)
             if failed_urls:
                 print(f"  失败提醒：目录已改名为 {folder.name}，失败链接已写入 link.txt")
+        emit(
+            progress_callback,
+            ProgressEvent(
+                order_index=order_index,
+                order_total=order_total,
+                order_no=folder_name,
+                item_index=item_total,
+                item_total=item_total,
+                message=f"完成 {folder.name}",
+            ),
+        )
+
     print(f"完成：输出目录 {output_root.resolve()}，失败项 {failures}")
     return 1 if failures else 0
 
@@ -469,8 +616,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--browser-fallback",
         choices=("off", "headless", "visible"),
-        default="headless",
-        help="直连失败后的浏览器回退方式（默认：headless）",
+        default="visible",
+        help="直连失败后的浏览器回退方式（默认：visible）",
     )
     parser.add_argument(
         "--browser-profile",

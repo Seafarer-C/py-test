@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import os
 import queue
-import re
 import sys
 import threading
 import traceback
@@ -94,11 +93,11 @@ class App(tk.Tk):
 
         ttk.Label(outer, text="Excel 文件").grid(row=1, column=0, sticky="w", pady=5)
         ttk.Entry(outer, textvariable=self.xlsx_var).grid(row=1, column=1, sticky="ew", padx=8)
-        ttk.Button(outer, text="选择…", command=self._choose_xlsx).grid(row=1, column=2)
+        ttk.Button(outer, text="选择", command=self._choose_xlsx).grid(row=1, column=2)
 
         ttk.Label(outer, text="输出目录").grid(row=2, column=0, sticky="w", pady=5)
         ttk.Entry(outer, textvariable=self.output_var).grid(row=2, column=1, sticky="ew", padx=8)
-        ttk.Button(outer, text="选择…", command=self._choose_output).grid(row=2, column=2)
+        ttk.Button(outer, text="选择", command=self._choose_output).grid(row=2, column=2)
 
         options = ttk.Frame(outer)
         options.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(8, 4))
@@ -109,12 +108,12 @@ class App(tk.Tk):
         fallback = ttk.Combobox(
             options,
             textvariable=self.browser_var,
-            values=("headless", "visible", "off"),
+            values=("visible", "headless", "off"),
             state="readonly",
             width=12,
         )
         fallback.pack(side="left")
-        ttk.Label(options, text="（无头 / 可见登录 / 关闭）").pack(side="left", padx=6)
+        ttk.Label(options, text="（可见登录 / 无头 / 关闭）").pack(side="left", padx=6)
 
         buttons = ttk.Frame(outer)
         buttons.grid(row=4, column=0, columnspan=3, sticky="ew", pady=10)
@@ -184,12 +183,15 @@ class App(tk.Tk):
         self.worker = threading.Thread(target=self._run, args=(args,), daemon=True)
         self.worker.start()
 
+    def _on_progress(self, event: xlsx2files.ProgressEvent) -> None:
+        self.messages.put(("progress", event))
+
     def _run(self, args: argparse.Namespace) -> None:
         writer = QueueWriter(self.messages)
         old_stdout, old_stderr = sys.stdout, sys.stderr
         try:
             sys.stdout = sys.stderr = writer
-            code = xlsx2files.process(args)
+            code = xlsx2files.process(args, progress_callback=self._on_progress)
             writer.flush()
             self.messages.put(("done", code))
         except Exception:
@@ -212,14 +214,15 @@ class App(tk.Tk):
                     line = str(payload)
                     self.log.insert("end", line + "\n")
                     self.log.see("end")
-                    match = re.search(r"\[(\d+)/(\d+)\]", line)
-                    if match:
-                        current, total = map(int, match.groups())
-                        self.progress["value"] = current * 100 / total
-                        self.progress_text.set(f"{current} / {total}")
-                        self.status_var.set(line.split("]", 1)[-1].strip())
-                    elif "已下载：" in line or "下载失败：" in line or "已解压" in line:
-                        self.status_var.set(line.strip())
+                elif kind == "progress":
+                    event = payload
+                    if event.order_total:
+                        self.progress["value"] = event.order_index * 100 / event.order_total
+                        self.progress_text.set(f"{event.order_index} / {event.order_total}")
+                    status = event.message or event.order_no
+                    if event.item_total:
+                        status = f"{event.order_no}（{event.item_index}/{event.item_total}） {event.message}".strip()
+                    self.status_var.set(status)
                 elif kind == "done":
                     code = int(payload)
                     self.start_button.configure(state="normal")
@@ -232,7 +235,10 @@ class App(tk.Tk):
                         self.status_var.set("任务已停止")
                     else:
                         self.status_var.set("处理完成，但存在失败项，请查看日志")
-                        messagebox.showwarning("存在失败项", "部分内容未成功处理，请查看运行日志。")
+                        messagebox.showwarning(
+                            "存在失败项",
+                            "部分内容未成功处理，请查看运行日志及带“_下载失败”后缀的订单目录。",
+                        )
         except queue.Empty:
             pass
         self.after(100, self._poll_messages)
