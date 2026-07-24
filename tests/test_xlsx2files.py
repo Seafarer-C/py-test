@@ -65,6 +65,56 @@ class UrlExtractionTests(unittest.TestCase):
             ["https://example.com/a.png", "https://example.com/b.png"],
         )
 
+    def test_pipe_separated_urls(self) -> None:
+        cell = (
+            "https://spacing.example/a.jpg|"
+            "https://filedesign.example/b.png|"
+            "https://cdn.example/c.webp"
+        )
+        self.assertEqual(
+            xlsx2files.extract_urls(cell),
+            [
+                "https://spacing.example/a.jpg",
+                "https://filedesign.example/b.png",
+                "https://cdn.example/c.webp",
+            ],
+        )
+
+    def test_mixed_unknown_separators(self) -> None:
+        cell = (
+            "https://a.example/1.png|"
+            "https://b.example/2.jpg;"
+            "https://c.example/3.webp，"
+            "https://d.example/4.gif；"
+            "https://e.example/5.bmp、"
+            "https://f.example/6.png\n"
+            "https://g.example/7.png@@@https://h.example/8.png"
+        )
+        self.assertEqual(
+            xlsx2files.extract_urls(cell),
+            [
+                "https://a.example/1.png",
+                "https://b.example/2.jpg",
+                "https://c.example/3.webp",
+                "https://d.example/4.gif",
+                "https://e.example/5.bmp",
+                "https://f.example/6.png",
+                "https://g.example/7.png",
+                "https://h.example/8.png",
+            ],
+        )
+
+    def test_keeps_comma_inside_single_url_query(self) -> None:
+        cell = "https://example.com/api?ids=1,2,3&name=a"
+        self.assertEqual(xlsx2files.extract_urls(cell), [cell])
+
+    def test_comma_joined_absolute_urls(self) -> None:
+        cell = "https://example.com/a.png,https://example.com/b.png"
+        self.assertEqual(
+            xlsx2files.extract_urls(cell),
+            ["https://example.com/a.png", "https://example.com/b.png"],
+        )
+
 
 class PageImageTests(unittest.TestCase):
     def test_discover_page_images_filters_thumbs(self) -> None:
@@ -111,12 +161,29 @@ class FailureRetryTests(unittest.TestCase):
             root = Path(tmp)
             folder = root / "ORDER1"
             folder.mkdir()
-            result = xlsx2files.finalize_order_folder(folder, "ORDER1", ["https://fail.example/a"])
+            failures = [
+                xlsx2files.DownloadFailure(
+                    order_no="ORDER1",
+                    category="通用下载地址",
+                    url="https://fail.example/a",
+                    reason="HTTP Error 404: Not Found",
+                    browser_used=False,
+                )
+            ]
+            result = xlsx2files.finalize_order_folder(folder, "ORDER1", failures)
             self.assertTrue(result.name.endswith("_下载失败"))
             link = result / "link.txt"
             self.assertTrue(link.exists())
             text = link.read_text(encoding="utf-8-sig")
             self.assertEqual(text.strip(), "https://fail.example/a")
+            log = result / "失败日志.txt"
+            self.assertTrue(log.exists())
+            log_text = log.read_text(encoding="utf-8-sig")
+            self.assertIn("订单号: ORDER1", log_text)
+            self.assertIn("URL: https://fail.example/a", log_text)
+            self.assertIn("原因: HTTP Error 404: Not Found", log_text)
+            self.assertIn("类别: 通用下载地址", log_text)
+            self.assertIn("已启动浏览器回退: 否", log_text)
 
     def test_prepare_restores_failed_folder(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -128,15 +195,17 @@ class FailureRetryTests(unittest.TestCase):
             self.assertEqual(restored.name, "ORDER1")
             self.assertTrue((restored / "link.txt").exists())
 
-    def test_success_removes_link_txt(self) -> None:
+    def test_success_removes_link_and_failure_log(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             folder = root / "ORDER1"
             folder.mkdir()
             (folder / "link.txt").write_text("old\n", encoding="utf-8-sig")
+            (folder / "失败日志.txt").write_text("old log\n", encoding="utf-8-sig")
             result = xlsx2files.finalize_order_folder(folder, "ORDER1", [])
             self.assertEqual(result.name, "ORDER1")
             self.assertFalse((result / "link.txt").exists())
+            self.assertFalse((result / "失败日志.txt").exists())
 
 
 class ExcelParserTests(unittest.TestCase):
@@ -239,6 +308,12 @@ class ExcelParserTests(unittest.TestCase):
             self.assertTrue(failed.is_dir())
             link = (failed / "link.txt").read_text(encoding="utf-8-sig").strip()
             self.assertEqual(link, "https://example.com/a.png")
+            log_text = (failed / "失败日志.txt").read_text(encoding="utf-8-sig")
+            self.assertIn("订单号: MEGFAIL", log_text)
+            self.assertIn("URL: https://example.com/a.png", log_text)
+            self.assertIn("原因: simulated timeout", log_text)
+            self.assertIn("类别: 通用下载地址", log_text)
+            self.assertIn("已启动浏览器回退: 否", log_text)
 
     def test_cancel_returns_130(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

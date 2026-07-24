@@ -14,7 +14,8 @@ import sys
 import tarfile
 import tempfile
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 from urllib.parse import parse_qs, unquote, urlparse
@@ -24,8 +25,15 @@ import openpyxl
 
 
 INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-URL_RE = re.compile(r"https?://[^\s;，；]+", re.IGNORECASE)
+# 以 http(s):// 起点定位 URL；分隔符不枚举，避免漏掉业务侧新分隔写法。
+URL_START_RE = re.compile(r"https?://", re.IGNORECASE)
+# 合法下载 URL 末尾通常落在字母数字或常见路径/查询字符上。
+URL_TAIL_OK_RE = re.compile(r"[A-Za-z0-9/=%~_-]$")
+# 兼容旧调用：页面效果图探测等仍按“找第一个 URL”使用。
+URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 ARCHIVE_SUFFIXES = (".tar.gz", ".tar.bz2", ".tgz", ".tbz2", ".zip", ".tar", ".7z")
+FAILURE_LOG_NAME = "失败日志.txt"
+LINK_FILE_NAME = "link.txt"
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -54,6 +62,21 @@ class ProgressEvent:
     item_index: int = 0
     item_total: int = 0
     message: str = ""
+
+
+@dataclass
+class DownloadFailure:
+    """单个素材下载/解压失败的详细记录，用于写入订单目录内失败日志。"""
+
+    order_no: str
+    category: str
+    url: str
+    reason: str
+    browser_used: bool = False
+    direct_error: str = ""
+    stage: str = "download"  # download | extract
+    file_name: str = ""
+    timestamp: str = field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 
 ProgressCallback = Callable[[ProgressEvent], None]
@@ -100,12 +123,47 @@ def prepare_order_folder(output_root: Path, folder_name: str) -> Path:
     return normal
 
 
-def finalize_order_folder(folder: Path, folder_name: str, failed_urls: list[str]) -> Path:
-    """下载失败时写 link.txt 并给目录加后缀；成功时清除旧标记。"""
-    link_file = folder / "link.txt"
-    if failed_urls:
-        unique_urls = list(dict.fromkeys(failed_urls))
+def format_failure_log(folder_name: str, failures: list[DownloadFailure]) -> str:
+    """生成订单目录内可读的详细失败日志。"""
+    lines = [
+        f"订单号: {folder_name}",
+        f"失败项数: {len(failures)}",
+        f"记录时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        "",
+        "说明: link.txt 仅含失败 URL，便于人工复制下载；本文件记录每次失败的详细原因。",
+        "",
+    ]
+    stage_labels = {"download": "下载", "extract": "解压"}
+    for index, item in enumerate(failures, start=1):
+        lines.extend(
+            [
+                f"-------- 失败项 {index} --------",
+                f"时间: {item.timestamp}",
+                f"阶段: {stage_labels.get(item.stage, item.stage)}",
+                f"类别: {item.category}",
+            ]
+        )
+        if item.url:
+            lines.append(f"URL: {item.url}")
+        if item.file_name:
+            lines.append(f"文件: {item.file_name}")
+        lines.append(f"原因: {item.reason}")
+        lines.append(f"已启动浏览器回退: {'是' if item.browser_used else '否'}")
+        if item.direct_error:
+            lines.append(f"直连失败原因: {item.direct_error}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def finalize_order_folder(folder: Path, folder_name: str, failures: list[DownloadFailure]) -> Path:
+    """下载失败时写 link.txt / 失败日志 并给目录加后缀；成功时清除旧标记。"""
+    link_file = folder / LINK_FILE_NAME
+    log_file = folder / FAILURE_LOG_NAME
+    download_failures = [item for item in failures if item.stage == "download" and item.url]
+    if download_failures:
+        unique_urls = list(dict.fromkeys(item.url for item in download_failures))
         link_file.write_text("\n".join(unique_urls) + "\n", encoding="utf-8-sig")
+        log_file.write_text(format_failure_log(folder_name, failures), encoding="utf-8-sig")
         target = folder.with_name(f"{folder_name}_下载失败")
         if folder != target:
             if target.exists():
@@ -114,6 +172,8 @@ def finalize_order_folder(folder: Path, folder_name: str, failed_urls: list[str]
         return target
     if link_file.exists():
         link_file.unlink()
+    if log_file.exists():
+        log_file.unlink()
     return folder
 
 
@@ -138,12 +198,41 @@ def unique_path(path: Path) -> Path:
         index += 1
 
 
+def split_url_candidates(text: str) -> list[str]:
+    """从任意拼接文本中切出候选 URL。
+
+    不依赖固定分隔符列表：凡是下一个 ``http://`` / ``https://`` 出现处即切开，
+    因此 ``|``、``;``、中文标点、换行、甚至未知符号夹在两条绝对地址之间都能拆开；
+    单个 URL 内部的 ``,``、``&`` 等合法字符会保留。
+    """
+    starts = [match.start() for match in URL_START_RE.finditer(text)]
+    if not starts:
+        return []
+
+    candidates: list[str] = []
+    for index, start in enumerate(starts):
+        end = starts[index + 1] if index + 1 < len(starts) else len(text)
+        chunk = text[start:end]
+        # 空白几乎不会出现在未编码 URL 中，作为硬边界截断更安全。
+        chunk = re.split(r"\s+", chunk, maxsplit=1)[0]
+        # 去掉粘在两条 URL 之间的任意分隔残留（|,;,@,@,中文标点等）。
+        while chunk and not URL_TAIL_OK_RE.search(chunk):
+            chunk = chunk[:-1]
+        if chunk and URL_START_RE.match(chunk):
+            candidates.append(chunk)
+    return candidates
+
+
 def extract_urls(value: object) -> list[str]:
     """提取下载 URL，并展开 Printerval 的 design_urls 参数。"""
     if value is None:
         return []
+    text = str(value).strip()
+    if not text:
+        return []
+
     found: list[str] = []
-    for url in URL_RE.findall(str(value).strip()):
+    for url in split_url_candidates(text):
         parsed = urlparse(url)
         query = parse_qs(parsed.query)
         design_urls = query.get("design_urls", [])
@@ -159,7 +248,7 @@ def extract_urls(value: object) -> list[str]:
                     )
                     found.append(item if item.startswith("http") else f"{parsed.scheme}://{asset_host}{item}")
         else:
-            found.append(url.rstrip(","))
+            found.append(url)
     return list(dict.fromkeys(found))
 
 
@@ -508,7 +597,7 @@ def process(args: argparse.Namespace, progress_callback: ProgressCallback | None
                 failures += 1
 
         download_index = 1
-        failed_urls: list[str] = []
+        failure_records: list[DownloadFailure] = []
         pending_urls: list[tuple[str, str]] = []
         for column in ([] if args.skip_downloads else download_columns):
             category = headers[column - 1]
@@ -520,7 +609,7 @@ def process(args: argparse.Namespace, progress_callback: ProgressCallback | None
         for item_index, (category, url) in enumerate(pending_urls, start=1):
             if cancel_event and cancel_event.is_set():
                 print("已请求停止，将在当前订单结束前停止")
-                finalize_order_folder(folder, folder_name, failed_urls)
+                finalize_order_folder(folder, folder_name, failure_records)
                 return 130
             emit(
                 progress_callback,
@@ -535,10 +624,12 @@ def process(args: argparse.Namespace, progress_callback: ProgressCallback | None
             )
             print(f"  下载类别：{category}")
             browser_used = False
+            direct_error_msg = ""
             try:
                 try:
                     files = download_url(url, folder, download_index)
                 except Exception as direct_error:
+                    direct_error_msg = str(direct_error)
                     if args.browser_fallback == "off":
                         raise
                     is_google_drive = urlparse(url).netloc.lower().endswith("drive.google.com")
@@ -568,6 +659,16 @@ def process(args: argparse.Namespace, progress_callback: ProgressCallback | None
                         )
                     except Exception as extract_error:
                         failures += 1
+                        failure_records.append(
+                            DownloadFailure(
+                                order_no=folder_name,
+                                category=category,
+                                url=url,
+                                reason=str(extract_error),
+                                stage="extract",
+                                file_name=downloaded.name,
+                            )
+                        )
                         print(
                             f"  解压失败：订单={folder_name} 类别={category} 文件={downloaded.name}\n"
                             f"    原因：{extract_error}",
@@ -575,7 +676,16 @@ def process(args: argparse.Namespace, progress_callback: ProgressCallback | None
                         )
             except Exception as exc:
                 failures += 1
-                failed_urls.append(url)
+                failure_records.append(
+                    DownloadFailure(
+                        order_no=folder_name,
+                        category=category,
+                        url=url,
+                        reason=str(exc),
+                        browser_used=browser_used,
+                        direct_error=direct_error_msg if browser_used else "",
+                    )
+                )
                 print(
                     f"  下载失败：订单={folder_name} 类别={category}\n"
                     f"    URL={url}\n"
@@ -587,9 +697,12 @@ def process(args: argparse.Namespace, progress_callback: ProgressCallback | None
             download_index += 1
 
         if not args.skip_downloads:
-            folder = finalize_order_folder(folder, folder_name, failed_urls)
-            if failed_urls:
-                print(f"  失败提醒：目录已改名为 {folder.name}，失败链接已写入 link.txt")
+            folder = finalize_order_folder(folder, folder_name, failure_records)
+            if any(item.stage == "download" and item.url for item in failure_records):
+                print(
+                    f"  失败提醒：目录已改名为 {folder.name}，"
+                    f"失败链接已写入 {LINK_FILE_NAME}，详细原因已写入 {FAILURE_LOG_NAME}"
+                )
         emit(
             progress_callback,
             ProgressEvent(
