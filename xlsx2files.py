@@ -34,6 +34,11 @@ URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 ARCHIVE_SUFFIXES = (".tar.gz", ".tar.bz2", ".tgz", ".tbz2", ".zip", ".tar", ".7z")
 FAILURE_LOG_NAME = "失败日志.txt"
 LINK_FILE_NAME = "link.txt"
+# macOS 上微信/系统沙盒目录通常不可由其他程序写入。
+RESTRICTED_OUTPUT_MARKERS = (
+    "/Library/Containers/",
+    "/Library/Group Containers/",
+)
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
@@ -85,6 +90,58 @@ ProgressCallback = Callable[[ProgressEvent], None]
 def emit(callback: ProgressCallback | None, event: ProgressEvent) -> None:
     if callback:
         callback(event)
+
+
+def path_is_restricted(path: Path) -> bool:
+    """判断路径是否位于常见不可写沙盒目录（如微信文件目录）。"""
+    try:
+        text = str(path.expanduser().resolve())
+    except OSError:
+        text = str(path.expanduser())
+    normalized = text.replace("\\", "/")
+    return any(marker in normalized for marker in RESTRICTED_OUTPUT_MARKERS)
+
+
+def probe_directory_writable(path: Path) -> None:
+    """确认目录可创建且可写入；失败时抛出带操作建议的错误。"""
+    path = path.expanduser()
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / f".xlsx2files_write_test_{os.getpid()}"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+    except OSError as exc:
+        raise RuntimeError(
+            f"无法写入输出目录：{path}\n"
+            f"原因：{exc}\n"
+            "请改选桌面、下载文件夹或其他有写权限的位置。"
+            "从微信等聊天软件目录打开的文件，默认输出路径可能受系统保护。"
+        ) from exc
+
+
+def suggest_output_dir(xlsx_path: Path) -> Path:
+    """为 Excel 选择合适的默认输出目录；避开微信等受保护路径。"""
+    xlsx_path = xlsx_path.expanduser()
+    name = f"{xlsx_path.stem}_输出"
+    beside = xlsx_path.with_name(name)
+    if not path_is_restricted(beside):
+        parent = beside.parent
+        if parent.is_dir():
+            try:
+                probe_directory_writable(parent)
+                return beside
+            except RuntimeError:
+                pass
+
+    for base in (Path.home() / "Desktop", Path.home() / "Downloads", Path.home() / "Documents"):
+        if base.is_dir() and not path_is_restricted(base):
+            candidate = base / name
+            try:
+                probe_directory_writable(base)
+                return candidate
+            except RuntimeError:
+                continue
+    return Path.cwd() / name
 
 
 def safe_name(value: object, fallback: str) -> str:
@@ -560,7 +617,7 @@ def process(args: argparse.Namespace, progress_callback: ProgressCallback | None
         raise RuntimeError("找不到名称含“下载地址”的列")
 
     output_root = Path(args.output)
-    output_root.mkdir(parents=True, exist_ok=True)
+    probe_directory_writable(output_root)
     qr_images = image_map(sheet, qr_columns[0]) if qr_columns else {}
     last_row = min(sheet.max_row, 1 + args.limit) if args.limit else sheet.max_row
     order_total = max(0, last_row - 1)

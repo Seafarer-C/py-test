@@ -142,8 +142,12 @@ class App(tk.Tk):
         path = filedialog.askopenfilename(filetypes=[("Excel 工作簿", "*.xlsx"), ("所有文件", "*.*")])
         if path:
             self.xlsx_var.set(path)
-            if self.output_var.get().endswith("output"):
-                self.output_var.set(str(Path(path).with_name(Path(path).stem + "_输出")))
+            current_output = self.output_var.get().strip()
+            if current_output.endswith("output") or xlsx2files.path_is_restricted(Path(current_output)):
+                suggested = xlsx2files.suggest_output_dir(Path(path))
+                self.output_var.set(str(suggested))
+                if xlsx2files.path_is_restricted(Path(path).parent):
+                    self.status_var.set(f"Excel 位于受保护目录，输出已改到：{suggested}")
 
     def _choose_output(self) -> None:
         path = filedialog.askdirectory()
@@ -162,6 +166,24 @@ class App(tk.Tk):
                 raise ValueError
         except ValueError:
             messagebox.showerror("无法开始", "测试条数必须是正整数。")
+            return
+
+        if xlsx2files.path_is_restricted(output):
+            suggested = xlsx2files.suggest_output_dir(xlsx)
+            change = messagebox.askyesno(
+                "输出目录不可写",
+                "当前输出目录位于微信等受系统保护的位置，程序无法写入。\n\n"
+                f"是否改用可写目录？\n{suggested}",
+            )
+            if not change:
+                return
+            output = suggested
+            self.output_var.set(str(output))
+
+        try:
+            xlsx2files.probe_directory_writable(output)
+        except RuntimeError as exc:
+            messagebox.showerror("无法开始", str(exc))
             return
 
         self.cancel_event.clear()
@@ -194,10 +216,10 @@ class App(tk.Tk):
             code = xlsx2files.process(args, progress_callback=self._on_progress)
             writer.flush()
             self.messages.put(("done", code))
-        except Exception:
+        except Exception as exc:
             writer.write(traceback.format_exc())
             writer.flush()
-            self.messages.put(("done", 1))
+            self.messages.put(("error", str(exc)))
         finally:
             sys.stdout, sys.stderr = old_stdout, old_stderr
 
@@ -223,6 +245,11 @@ class App(tk.Tk):
                     if event.item_total:
                         status = f"{event.order_no}（{event.item_index}/{event.item_total}） {event.message}".strip()
                     self.status_var.set(status)
+                elif kind == "error":
+                    self.start_button.configure(state="normal")
+                    self.stop_button.configure(state="disabled")
+                    self.status_var.set("处理失败，请查看提示")
+                    messagebox.showerror("处理失败", str(payload))
                 elif kind == "done":
                     code = int(payload)
                     self.start_button.configure(state="normal")
